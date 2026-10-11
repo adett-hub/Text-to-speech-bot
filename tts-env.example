@@ -1,0 +1,13 @@
+# Copy this file to .env and fill in your token
+DISCORD_TOKEN=paste-your-bot-token-here
+
+# Optional: your test server's ID, so slash commands appear instantly
+DEV_GUILD_ID=
+
+# Optional tweaks
+DEFAULT_VOICE=en-US-AriaNeural
+MAX_CHARS=300
+ANNOUNCE_NAMES=true
+SKIP_PREFIX=//
+# Only needed if ffmpeg isn't on your PATH, e.g. C:\ffmpeg\bin\ffmpeg.exe
+FFMPEG_PATH=ffmpeg
