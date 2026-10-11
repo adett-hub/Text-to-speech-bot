@@ -53,6 +53,7 @@ class Settings:
                 log.warning("Could not read %s, starting fresh", path)
 
     def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
 
     def tts_channel(self, guild_id: int) -> int | None:
