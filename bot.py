@@ -5,6 +5,7 @@ Reads messages aloud in a voice channel using Microsoft Edge neural voices (free
 - /join, /leave            : bring the bot in / out of your voice channel
 - /say <text>              : speak something once
 - /ttschannel [channel]    : (admins) auto-read every message posted in a text channel
+- /followrole [role]       : (admins) bot follows anyone with this role between voice channels
 - /voice <name>            : pick your personal voice (with autocomplete)
 - /skip, /clear            : skip the current line / empty the queue
 """
@@ -61,6 +62,13 @@ class Settings:
 
     def set_tts_channel(self, guild_id: int, channel_id: int | None):
         self.data["guilds"].setdefault(str(guild_id), {})["tts_channel"] = channel_id
+        self.save()
+
+    def follow_role(self, guild_id: int) -> int | None:
+        return self.data["guilds"].get(str(guild_id), {}).get("follow_role")
+
+    def set_follow_role(self, guild_id: int, role_id: int | None):
+        self.data["guilds"].setdefault(str(guild_id), {})["follow_role"] = role_id
         self.save()
 
     def voice_for(self, user_id: int) -> str:
@@ -151,6 +159,11 @@ class TTSBot(commands.Bot):
         self.settings = Settings(SETTINGS_PATH)
         self.players: dict[int, GuildPlayer] = {}
         self.voices: list[str] = []
+        self.voice_locks: dict[int, asyncio.Lock] = {}
+
+    def voice_lock(self, guild: discord.Guild) -> asyncio.Lock:
+        """Serialises joins/moves per server so quick channel-hopping can't race."""
+        return self.voice_locks.setdefault(guild.id, asyncio.Lock())
 
     async def setup_hook(self):
         self.voices = sorted(v["ShortName"] for v in await edge_tts.list_voices())
@@ -203,6 +216,7 @@ async def ensure_connected(interaction: discord.Interaction, ephemeral: bool = F
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    await join_followed_members()
 
 
 @bot.event
@@ -230,12 +244,77 @@ async def on_message(message: discord.Message):
     player.enqueue(text, bot.settings.voice_for(message.author.id))
 
 
+# ------------------------------------------------------------ follow role ---
+
+def is_followed(member: discord.Member) -> bool:
+    role_id = bot.settings.follow_role(member.guild.id)
+    return bool(role_id) and not member.bot and any(r.id == role_id for r in member.roles)
+
+
+def followed_member_in_voice(guild: discord.Guild, exclude: discord.Member | None = None) -> discord.Member | None:
+    """Someone with the follow role who is currently in a voice channel, if any."""
+    for channel in guild.voice_channels:
+        for m in channel.members:
+            if m != exclude and is_followed(m):
+                return m
+    return None
+
+
+async def connect_to(guild: discord.Guild, channel: discord.VoiceChannel):
+    """Join or move to a channel; log and carry on if it's not allowed."""
+    async with bot.voice_lock(guild):
+        vc = guild.voice_client
+        try:
+            if vc and vc.is_connected():
+                if vc.channel != channel:
+                    await vc.move_to(channel)
+            else:
+                if vc:
+                    await vc.disconnect(force=True)
+                await channel.connect(self_deaf=True, timeout=20)
+        except Exception:
+            log.exception("Couldn't follow into %s in guild %s", channel, guild.id)
+
+
+async def leave_or_follow_someone_else(guild: discord.Guild, exclude: discord.Member | None = None):
+    other = followed_member_in_voice(guild, exclude)
+    if other:
+        await connect_to(guild, other.voice.channel)
+    else:
+        await bot.disconnect(guild)
+
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    # Leave when everyone else has left the channel.
-    vc = member.guild.voice_client
+    guild = member.guild
+    if member.bot or before.channel == after.channel:
+        return  # ignore bots and mute/deafen changes
+
+    # Someone with the follow role joined, moved or left voice.
+    if is_followed(member):
+        if isinstance(after.channel, discord.VoiceChannel):
+            await connect_to(guild, after.channel)
+            return
+        vc = guild.voice_client
+        other = followed_member_in_voice(guild, exclude=member)
+        if vc and vc.channel == before.channel and other:
+            await connect_to(guild, other.voice.channel)
+            return
+        # otherwise stay put while other people are still in the channel
+
+    # Leave when everyone else has left the channel (or go to another followed member).
+    vc = guild.voice_client
     if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
-        await bot.disconnect(member.guild)
+        await leave_or_follow_someone_else(guild)
+
+
+async def join_followed_members():
+    """On startup, catch up with anyone who already has the role and is in voice."""
+    for guild in bot.guilds:
+        if not guild.voice_client:
+            target = followed_member_in_voice(guild)
+            if target:
+                await connect_to(guild, target.voice.channel)
 
 
 # ---------------------------------------------------------------- commands ---
@@ -322,6 +401,23 @@ async def ttschannel(interaction: discord.Interaction, channel: discord.TextChan
         )
     else:
         await interaction.response.send_message("Auto-reading turned off.")
+
+
+@bot.tree.command(description="Make the bot follow anyone with this role between voice channels (leave empty to turn off)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def followrole(interaction: discord.Interaction, role: discord.Role | None = None):
+    bot.settings.set_follow_role(interaction.guild.id, role.id if role else None)
+    if not role:
+        await interaction.response.send_message("Follow mode turned off.")
+        return
+    await interaction.response.send_message(
+        f"I'll follow anyone with {role.mention} into voice channels.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    target = followed_member_in_voice(interaction.guild)
+    if target:
+        await connect_to(interaction.guild, target.voice.channel)
 
 
 if __name__ == "__main__":
